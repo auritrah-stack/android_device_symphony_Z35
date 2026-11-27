@@ -9,8 +9,12 @@
 $(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit.mk)
 $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
 
-# Inherit some common Omni stuff.
+# Inherit the recovery vendor config (TWRP "omni" or OrangeFox "twrp")
+ifneq ($(wildcard vendor/omni/config/common.mk),)
 $(call inherit-product, vendor/omni/config/common.mk)
+else
+$(call inherit-product, vendor/twrp/config/common.mk)
+endif
 
 # Inherit from Z35 device
 $(call inherit-product, device/symphony/Z35/device.mk)
@@ -19,7 +23,7 @@ PRODUCT_DEVICE := Z35
 PRODUCT_NAME := omni_Z35
 PRODUCT_BRAND := Symphony
 PRODUCT_MODEL := Z35
-PRODUCT_MANUFACTURER := symphony
+PRODUCT_MANUFACTURER := Symphony
 
 PRODUCT_GMS_CLIENTID_BASE := android-symphonyedison
 
