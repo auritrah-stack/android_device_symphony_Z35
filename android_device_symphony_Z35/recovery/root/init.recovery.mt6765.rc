@@ -1,0 +1,20 @@
+on early-init
+    # MTK musb gadget: tell the driver that init has taken over the UDC
+    write /sys/module/musb_hdrc/parameters/kernel_init_done 1
+
+on init
+    # MTK USB runs on configfs
+    setprop sys.usb.configfs 1
+    setprop sys.usb.ffs.aio_compat 1
+    setprop vendor.usb.controller "musb-hdrc"
+    setprop vendor.usb.acm_cnt 0
+    setprop vendor.usb.acm_port0 ""
+    setprop vendor.usb.acm_port1 ""
+    setprop vendor.usb.acm_enable 0
+
+on fs
+    # same as stock recovery: switch the musb controller to data mode, otherwise
+    # the phone stays in charge-only and never enumerates for adb/MTP
+    write /sys/class/udc/musb-hdrc/device/cmode 2
+    # adb has to be up in recovery no matter what ro.debuggable says
+    start adbd
