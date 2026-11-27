@@ -120,7 +120,9 @@ PLATFORM_VERSION := 16.1.0
 
 # TWRP Configuration
 TW_THEME := portrait_hdpi
-TW_EXTRA_LANGUAGES := true
+# Disable optional translations to keep the recovery ramdisk small enough
+# for the device's 32 MiB recovery partition.
+TW_EXTRA_LANGUAGES := false
 TW_SCREEN_BLANK_ON_BOOT := true
 TW_NO_SCREEN_BLANK := true
 TW_USE_TOOLBOX := true
@@ -129,8 +131,8 @@ TW_EXCLUDE_APEX := true
 # Crypto (FBE v2 + metadata encryption, required for mounting /data)
 TW_INCLUDE_CRYPTO := true
 
-# exFAT / NTFS support for SD card and USB-OTG
-TW_INCLUDE_NTFS_3G := true
+# NTFS support is optional and omitted to reduce recovery image size.
+TW_INCLUDE_NTFS_3G := false
 
 # The device ships its own init.recovery.usb.rc (MTK configfs gadget / MTP)
 TW_EXCLUDE_DEFAULT_USB_INIT := true
