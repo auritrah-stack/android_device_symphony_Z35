@@ -1,116 +1,199 @@
-name: OrangeFox Recovery - Symphony Z35
+name: Build OrangeFox Recovery (Max 32MB)
 
 on:
   workflow_dispatch:
+    inputs:
+      fox_branch:
+        description: 'OrangeFox Manifest Branch (fox_12.1 or fox_11.0)'
+        required: true
+        default: 'fox_12.1'
+        type: choice
+        options:
+          - fox_12.1
+          - fox_11.0
+      build_target:
+        description: 'Build Target'
+        required: true
+        default: 'recovery'
+        type: choice
+        options:
+          - recovery
+          - boot
+          - vendorboot
 
-permissions:
-  contents: read
+env:
+  MAX_SIZE_BYTES: 33554432 # 32 MB (32 * 1024 * 1024)
+  DEVICE_CODENAME: Z35
 
 jobs:
-  build:
-    # Android source builds need a preconfigured machine with substantial disk/RAM.
-    # Register it in repository Settings > Actions > Runners with the android-build label.
-    runs-on: [self-hosted, linux, x64, android-build]
-    timeout-minutes: 360
+  build-orangefox:
+    name: Build & Shrink OrangeFox
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Check out device tree
-        uses: actions/checkout@v4
-        with:
-          path: device-tree
-
-      - name: Initialize and sync OrangeFox source
-        shell: bash
+      - name: Maximize Build Disk Space
         run: |
-          set -euo pipefail
-          command -v repo >/dev/null || { echo "repo tool is missing on this runner"; exit 1; }
-          command -v python3 >/dev/null || { echo "python3 is missing on this runner"; exit 1; }
-          mkdir -p fox
-          cd fox
-          repo init --depth=1 -u https://github.com/OrangeFoxRecovery/manifest.git -b fox_12.1
-          repo sync -j"$(nproc --all)" --force-sync
-          mkdir -p device/symphony
-          cp -a ../device-tree device/symphony/Z35
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
+          sudo apt-get clean
+          df -h
 
-      - name: Build and enforce 32 MiB recovery limit
-        shell: bash
+      - name: Install Build Dependencies
         run: |
-          set -euo pipefail
-          cd fox
-          export ALLOW_MISSING_DEPENDENCIES=true
-          image="out/target/product/Z35/recovery.img"
-          limit=$((32 * 1024 * 1024))
+          sudo apt-get update
+          sudo apt-get install -y git aria2 curl rsync bc bison build-essential ccache flex \
+            g++-multilib gcc-multilib gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush schedtool squashfs-tools xsltproc zip zlib1g-dev \
+            python-is-python3 cpio lzma xz-utils
 
-          build_recovery() {
-            set +e
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Sync OrangeFox Sources
+        run: |
+          mkdir -p ~/orangefox_sync
+          cd ~/orangefox_sync
+          git clone https://gitlab.com/OrangeFox/sync.git
+          cd sync
+          ./orangefox_sync.sh --branch ${{ github.event.inputs.fox_branch }} --path ~/fox_src
+
+      - name: Clone & Detect Device Tree Path
+        id: dt
+        run: |
+          git clone https://github.com /tmp/dt_check
+          
+          # Auto-detect LOCAL_PATH / device path from BoardConfig.mk or AndroidProducts.mk
+          DETECTED_PATH=$(grep -rnE "device/symphony/Z35|device/[a-zA-Z0-9_-]+/Z35" /tmp/dt_check | head -n 1 | grep -oE "device/[a-zA-Z0-9_-]+/Z35" || true)
+          if [ -z "$DETECTED_PATH" ]; then
+            DETECTED_PATH="device/symphony/Z35"
+          fi
+          
+          mkdir -p ~/fox_src/$(dirname "$DETECTED_PATH")
+          mv /tmp/dt_check ~/fox_src/"$DETECTED_PATH"
+          
+          # Detect lunch prefix (twrp_Z35 vs omni_Z35)
+          if [ -f ~/fox_src/"$DETECTED_PATH"/twrp_Z35.mk ]; then
+            LUNCH_TARGET="twrp_Z35-eng"
+          else
+            LUNCH_TARGET="omni_Z35-eng"
+          fi
+
+          echo "device_path=$DETECTED_PATH" >> $GITHUB_OUTPUT
+          echo "lunch_target=$LUNCH_TARGET" >> $GITHUB_OUTPUT
+          echo "Detected Path: $DETECTED_PATH | Lunch Target: $LUNCH_TARGET"
+
+      - name: Build & Iterative Shrink Loop (<= 32MB)
+        id: build
+        run: |
+          cd ~/fox_src
+          DT_DIR="$HOME/fox_src/${{ steps.dt.outputs.device_path }}"
+          OUT_DIR="$HOME/fox_src/out/target/product/${{ env.DEVICE_CODENAME }}"
+          TARGET="${{ github.event.inputs.build_target }}"
+
+          check_size() {
+            IMG_FILE="$OUT_DIR/${TARGET}.img"
+            if [ ! -f "$IMG_FILE" ]; then
+              echo "0"
+              return
+            fi
+            stat -c%s "$IMG_FILE"
+          }
+
+          run_build() {
             source build/envsetup.sh
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-              lunch twrp_Z35-eng
-              rc=$?
-            fi
-            if [ "$rc" -eq 0 ]; then
-              mka recoveryimage
-              rc=$?
-            fi
-            set -e
-            return "$rc"
+            export ALLOW_MISSING_DEPENDENCIES=true
+            export FOX_BUILD_DEVICE="${{ env.DEVICE_CODENAME }}"
+            lunch "${{ steps.dt.outputs.lunch_target }}"
+            mka "${TARGET}image" -j$(nproc --all)
           }
 
-          echo "Building OrangeFox recovery (first pass)..."
-          first_rc=0
-          build_recovery || first_rc=$?
-          if [ ! -f "$image" ]; then
-            echo "Build did not produce $image (exit code $first_rc)."
+          # --- ATTEMPT 0: Standard Build ---
+          echo "=== Attempt 0: Standard OrangeFox Build ==="
+          run_build
+          SIZE=$(check_size)
+          echo "Attempt 0 Image Size: $SIZE bytes (Limit: ${{ env.MAX_SIZE_BYTES }} bytes)"
+
+          # --- ATTEMPT 1: Strip Optional Binaries & Trim ---
+          if [ "$SIZE" -gt "${{ env.MAX_SIZE_BYTES }}" ]; then
+            echo "=== Image exceeds 32MB ($SIZE bytes). Attempt 1: Stripping extra tools & themes ==="
+            export FOX_REMOVE_BASH=1
+            export FOX_REMOVE_AAPT=1
+            export FOX_USE_TAR_BINARY=0
+            export FOX_USE_SED_BINARY=0
+            export FOX_USE_NANO_EDITOR=0
+            export FOX_USE_ZIP_BINARY=0
+            export OF_DISABLE_EXTRA_ABOUT_PAGE=1
+            export OF_NO_TREBLE_COMPATIBILITY_CHECK=1
+            export OF_SKIP_MULTIUSER_FOLDERS_BACKUP=1
+            
+            rm -rf "$OUT_DIR/recovery" "$OUT_DIR/root" "$OUT_DIR/${TARGET}.img"
+            run_build
+            SIZE=$(check_size)
+            echo "Attempt 1 Image Size: $SIZE bytes"
+          fi
+
+          # --- ATTEMPT 2: Enable LZMA Ramdisk Compression ---
+          if [ "$SIZE" -gt "${{ env.MAX_SIZE_BYTES }}" ]; then
+            echo "=== Image still exceeds 32MB ($SIZE bytes). Attempt 2: Enabling LZMA Compression ==="
+            export OF_USE_LZMA_COMPRESSION=1
+            if ! grep -q "BOARD_RAMDISK_USE_LZMA" "$DT_DIR/BoardConfig.mk"; then
+              echo "" >> "$DT_DIR/BoardConfig.mk"
+              echo "BOARD_RAMDISK_USE_LZMA := true" >> "$DT_DIR/BoardConfig.mk"
+            fi
+            
+            rm -rf "$OUT_DIR/recovery" "$OUT_DIR/root" "$OUT_DIR/${TARGET}.img"
+            run_build
+            SIZE=$(check_size)
+            echo "Attempt 2 Image Size: $SIZE bytes"
+          fi
+
+          # --- ATTEMPT 3: Manual Ramdisk Prune & Max LZMA Repack ---
+          if [ "$SIZE" -gt "${{ env.MAX_SIZE_BYTES }}" ]; then
+            echo "=== Image still exceeds 32MB ($SIZE bytes). Attempt 3: Pruning non-essential ramdisk assets ==="
+            MAGISKBOOT=$(find "$OUT_DIR" "$HOME/fox_src/vendor/recovery" -name "magiskboot" 2>/dev/null | head -n 1)
+            
+            if [ -n "$MAGISKBOOT" ]; then
+              mkdir -p /tmp/repack && cd /tmp/repack
+              cp "$OUT_DIR/${TARGET}.img" ./recovery.img
+              "$MAGISKBOOT" unpack recovery.img
+              
+              mkdir -p ramdisk_dir && cd ramdisk_dir
+              cpio -idm < ../ramdisk.cpio 2>/dev/null || true
+              
+              # Remove non-English TWRP/OFRP translations and extra fonts to save several MBs
+              find . -path "*/twres/languages/*.xml" ! -name "en.xml" -delete 2>/dev/null || true
+              find . -path "*/FFiles/*" -name "*.ttf" ! -name "*Roboto*" ! -name "*Droid*" -delete 2>/dev/null || true
+              rm -rf ./system/bin/nano ./sbin/nano ./sbin/bash ./system/bin/bash 2>/dev/null || true
+              
+              find . | cpio -o -H newc | lzma -9 -e > ../ramdisk.cpio
+              cd /tmp/repack
+              "$MAGISKBOOT" repack recovery.img new_recovery.img
+              cp new_recovery.img "$OUT_DIR/${TARGET}.img"
+              cd ~/fox_src
+              
+              SIZE=$(check_size)
+              echo "Attempt 3 Image Size: $SIZE bytes"
+            fi
+          fi
+
+          # --- FINAL VERIFICATION ---
+          if [ "$SIZE" -eq 0 ] || [ "$SIZE" -gt "${{ env.MAX_SIZE_BYTES }}" ]; then
+            echo "::error::Failed to shrink ${TARGET}.img below 32MB. Final size: $SIZE bytes."
             exit 1
           fi
 
-          bytes=$(stat -c '%s' "$image")
-          echo "First-pass recovery size: $bytes bytes (limit: $limit)."
-          if [ "$bytes" -gt "$limit" ]; then
-            echo "Image is too large; disabling optional translations and NTFS support, then rebuilding."
-            python3 - <<'PY'
-          from pathlib import Path
-          p = Path("device/symphony/Z35/BoardConfig.mk")
-          s = p.read_text()
-          replacements = {
-              "TW_EXTRA_LANGUAGES := true": "TW_EXTRA_LANGUAGES := false",
-              "TW_INCLUDE_NTFS_3G := true": "TW_INCLUDE_NTFS_3G := false",
-          }
-          for old, new in replacements.items():
-              s = s.replace(old, new)
-          p.write_text(s)
-          if "TW_EXTRA_LANGUAGES := true" in s or "TW_INCLUDE_NTFS_3G := true" in s:
-              raise SystemExit("Could not disable all configured optional size features")
-          PY
-            rm -f "$image"
-            build_rc=0
-            build_recovery || build_rc=$?
-            if [ ! -f "$image" ]; then
-              echo "Fallback build did not produce $image (exit code $build_rc)."
-              exit 1
-            fi
-            bytes=$(stat -c '%s' "$image")
-            echo "Fallback recovery size: $bytes bytes (limit: $limit)."
-            if [ "$build_rc" -ne 0 ]; then
-              echo "Fallback build command failed with exit code $build_rc."
-              exit "$build_rc"
-            fi
-          elif [ "$first_rc" -ne 0 ]; then
-            echo "Build command failed with exit code $first_rc."
-            exit "$first_rc"
-          fi
+          FINAL_MB=$(echo "scale=2; $SIZE / 1048576" | bc)
+          echo "Success! Final ${TARGET}.img size: ${FINAL_MB} MB ($SIZE bytes)"
+          echo "final_size_mb=${FINAL_MB}" >> $GITHUB_OUTPUT
 
-          if [ "$bytes" -gt "$limit" ]; then
-            echo "ERROR: recovery image is still larger than the 32 MiB recovery partition. Refusing to publish it as a valid build."
-            exit 1
-          fi
-          echo "PASS: recovery.img is within the 32 MiB partition limit."
-
-      - name: Upload recovery image
-        if: always()
+      - name: Upload OrangeFox Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OrangeFox-Z35-recovery
-          path: fox/out/target/product/Z35/recovery.img
+          name: OrangeFox-${{ env.DEVICE_CODENAME }}-${{ steps.build.outputs.final_size_mb }}MB
+          path: |
+            ~/fox_src/out/target/product/${{ env.DEVICE_CODENAME }}/${{ github.event.inputs.build_target }}.img
+            ~/fox_src/out/target/product/${{ env.DEVICE_CODENAME }}/OrangeFox*.zip
           if-no-files-found: warn
-          retention-days: 7
