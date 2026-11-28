@@ -1,0 +1,116 @@
+name: OrangeFox Recovery - Symphony Z35
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Android source builds need a preconfigured machine with substantial disk/RAM.
+    # Register it in repository Settings > Actions > Runners with the android-build label.
+    runs-on: [self-hosted, linux, x64, android-build]
+    timeout-minutes: 360
+    steps:
+      - name: Check out device tree
+        uses: actions/checkout@v4
+        with:
+          path: device-tree
+
+      - name: Initialize and sync OrangeFox source
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v repo >/dev/null || { echo "repo tool is missing on this runner"; exit 1; }
+          command -v python3 >/dev/null || { echo "python3 is missing on this runner"; exit 1; }
+          mkdir -p fox
+          cd fox
+          repo init --depth=1 -u https://github.com/OrangeFoxRecovery/manifest.git -b fox_12.1
+          repo sync -j"$(nproc --all)" --force-sync
+          mkdir -p device/symphony
+          cp -a ../device-tree device/symphony/Z35
+
+      - name: Build and enforce 32 MiB recovery limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd fox
+          export ALLOW_MISSING_DEPENDENCIES=true
+          image="out/target/product/Z35/recovery.img"
+          limit=$((32 * 1024 * 1024))
+
+          build_recovery() {
+            set +e
+            source build/envsetup.sh
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              lunch twrp_Z35-eng
+              rc=$?
+            fi
+            if [ "$rc" -eq 0 ]; then
+              mka recoveryimage
+              rc=$?
+            fi
+            set -e
+            return "$rc"
+          }
+
+          echo "Building OrangeFox recovery (first pass)..."
+          first_rc=0
+          build_recovery || first_rc=$?
+          if [ ! -f "$image" ]; then
+            echo "Build did not produce $image (exit code $first_rc)."
+            exit 1
+          fi
+
+          bytes=$(stat -c '%s' "$image")
+          echo "First-pass recovery size: $bytes bytes (limit: $limit)."
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "Image is too large; disabling optional translations and NTFS support, then rebuilding."
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("device/symphony/Z35/BoardConfig.mk")
+          s = p.read_text()
+          replacements = {
+              "TW_EXTRA_LANGUAGES := true": "TW_EXTRA_LANGUAGES := false",
+              "TW_INCLUDE_NTFS_3G := true": "TW_INCLUDE_NTFS_3G := false",
+          }
+          for old, new in replacements.items():
+              s = s.replace(old, new)
+          p.write_text(s)
+          if "TW_EXTRA_LANGUAGES := true" in s or "TW_INCLUDE_NTFS_3G := true" in s:
+              raise SystemExit("Could not disable all configured optional size features")
+          PY
+            rm -f "$image"
+            build_rc=0
+            build_recovery || build_rc=$?
+            if [ ! -f "$image" ]; then
+              echo "Fallback build did not produce $image (exit code $build_rc)."
+              exit 1
+            fi
+            bytes=$(stat -c '%s' "$image")
+            echo "Fallback recovery size: $bytes bytes (limit: $limit)."
+            if [ "$build_rc" -ne 0 ]; then
+              echo "Fallback build command failed with exit code $build_rc."
+              exit "$build_rc"
+            fi
+          elif [ "$first_rc" -ne 0 ]; then
+            echo "Build command failed with exit code $first_rc."
+            exit "$first_rc"
+          fi
+
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "ERROR: recovery image is still larger than the 32 MiB recovery partition. Refusing to publish it as a valid build."
+            exit 1
+          fi
+          echo "PASS: recovery.img is within the 32 MiB partition limit."
+
+      - name: Upload recovery image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-Z35-recovery
+          path: fox/out/target/product/Z35/recovery.img
+          if-no-files-found: warn
+          retention-days: 7
